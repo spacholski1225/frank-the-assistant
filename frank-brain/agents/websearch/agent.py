@@ -1,32 +1,12 @@
 from langchain.agents import initialize_agent, AgentType
-from langchain.tools import BaseTool
-from langchain_community.tools import DuckDuckGoSearchRun
 from langchain_openai import ChatOpenAI
 from langchain.schema import HumanMessage
 from typing import Type, Optional, List
 import os
 from dotenv import load_dotenv
+from .tools import WebSearchTool
 
 load_dotenv()
-
-
-class WebSearchTool(BaseTool):
-    name: str = "web_search"
-    description: str = "Useful for searching information on the internet when you need current information or facts about any topic"
-    
-    def __init__(self):
-        super().__init__()
-        self._search = DuckDuckGoSearchRun()
-    
-    def _run(self, query: str) -> str:
-        try:
-            results = self._search.run(query)
-            return results
-        except Exception as e:
-            return f"Error during search: {str(e)}"
-    
-    def _arun(self, query: str):
-        raise NotImplementedError("WebSearchTool does not support async")
 
 
 class WebSearchAgent:
@@ -72,29 +52,3 @@ class WebSearchAgent:
                 "intermediate_steps": [],
                 "success": False
             }
-    
-    def chat(self, message: str) -> str:
-        """
-        Simple chat interface for web search agent
-        
-        Args:
-            message (str): User message/query
-            
-        Returns:
-            str: Agent's response
-        """
-        result = self.search(message)
-        return result["answer"]
-
-
-def create_websearch_agent(model_name: str = "gpt-3.5-turbo") -> WebSearchAgent:
-    """
-    Factory function to create a web search agent
-    
-    Args:
-        model_name (str): OpenAI model to use
-        
-    Returns:
-        WebSearchAgent: Configured web search agent
-    """
-    return WebSearchAgent(model_name=model_name)

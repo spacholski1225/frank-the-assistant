@@ -39,11 +39,10 @@ async def transcribe_audio(
             "segments": result["segments"]
         }
         
-        query = f"Przeszukaj internet i odpowiedz na pytanie: {result['text']}"
+        query = f"Przeszukaj internet i odpowiedz na pytanie: {result['text']}. Odpowiedz krótko."
         search_result = websearch_agent.search(query)
-        response["search_results"] = search_result
-        
-        return response
+
+        return {"answer": search_result.get("answer", "No answer available")}
     
     except Exception as e:
         if 'temp_file_path' in locals() and os.path.exists(temp_file_path):

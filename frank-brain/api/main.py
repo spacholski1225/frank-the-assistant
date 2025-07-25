@@ -50,6 +50,9 @@ async def transcribe_audio(
         raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
 
 import time
+import wave
+import struct
+import datetime
 processing_lock = False
 
 @app.post("/stream/")
@@ -80,11 +83,24 @@ async def stream_audio(request: Request) -> Dict[str, Any]:
             print(f"[DEBUG] First {len(first_bytes)} bytes: {first_bytes}")
             print(f"[DEBUG] First bytes as hex: {first_bytes.hex()}")
         
-        # Zapisz plik debug
-        debug_file_path = f"/tmp/debug_audio_{len(body)}_bytes.wav"
+        # Zapisz surowe audio jako plik debug
+        debug_file_path = f"/tmp/debug_audio_{len(body)}_bytes.raw"
         with open(debug_file_path, "wb") as debug_file:
             debug_file.write(body)
-        print(f"[DEBUG] Saved received data to: {debug_file_path}")
+        print(f"[DEBUG] Saved received raw data to: {debug_file_path}")
+        
+        # Konwertuj raw audio na WAV do łatwego odtwarzania
+        wav_file_path = f"/tmp/audio_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
+        try:
+            # Konwertuj raw 16-bit audio na WAV
+            with wave.open(wav_file_path, 'wb') as wav_file:
+                wav_file.setnchannels(1)  # mono
+                wav_file.setsampwidth(2)  # 16-bit = 2 bytes
+                wav_file.setframerate(16000)  # 16kHz
+                wav_file.writeframes(body)
+            print(f"[DEBUG] Saved as WAV file: {wav_file_path}")
+        except Exception as wav_error:
+            print(f"[DEBUG] WAV conversion failed: {str(wav_error)}")
         
         # Konwertuj sample rate jeśli potrzebne
         try:
@@ -112,9 +128,18 @@ async def stream_audio(request: Request) -> Dict[str, Any]:
             # os.unlink(converted_path)
             
             if not result['text'].strip():
-                return {"debug": f"Received {len(body)} bytes, transcription EMPTY - check audio level"}
+                return {
+                    "debug": f"Received {len(body)} bytes, transcription EMPTY - check audio level",
+                    "wav_file": wav_file_path,
+                    "raw_file": debug_file_path
+                }
             else:
-                return {"debug": f"Received {len(body)} bytes, transcribed: '{result['text']}'"}
+                return {
+                    "debug": f"Received {len(body)} bytes, transcribed: '{result['text']}'",
+                    "transcription": result['text'],
+                    "wav_file": wav_file_path,
+                    "raw_file": debug_file_path
+                }
         except Exception as whisper_error:
             print(f"[DEBUG] Whisper/conversion error: {str(whisper_error)}")
             return {"debug": f"Received {len(body)} bytes, processing failed: {str(whisper_error)}"}

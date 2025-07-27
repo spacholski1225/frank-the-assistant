@@ -10,3 +10,4 @@ langgraph==0.0.20
 langchain==0.1.0
 duckduckgo-search==3.9.6
 langchaing_community
+sounddevice

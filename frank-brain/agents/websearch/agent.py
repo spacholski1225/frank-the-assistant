@@ -25,7 +25,9 @@ class WebSearchAgent:
             agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
             verbose=True,
             handle_parsing_errors=True,
-            return_intermediate_steps=True
+            return_intermediate_steps=True,
+            max_iterations=3,  # Limit iterations to prevent timeout
+            max_execution_time=30  # 30 second timeout
         )
     
     def search(self, query: str) -> dict:

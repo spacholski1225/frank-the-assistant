@@ -53,7 +53,19 @@ import time
 import wave
 import struct
 import datetime
+import sounddevice as sd
+import numpy as np
+import requests
+import threading
+from collections import deque
+
 processing_lock = False
+recording = False
+latest_text = ""
+audio_buffer = deque(maxlen=160000)  # 10 seconds at 16kHz
+last_button_press = 0
+DEBOUNCE_TIME = 0.5  # 500ms debounce
+AI_SERVER_URL = os.getenv("AI_SERVER_URL", "http://localhost:8001")
 
 # Chunked streaming storage
 chunk_sessions = {}  # session_id -> {chunks: {chunk_id: data}, total_chunks: int, received_chunks: int}
@@ -272,9 +284,225 @@ async def complete_session(request: Request) -> Dict[str, Any]:
 async def get_sessions():
     return {"active_sessions": list(chunk_sessions.keys())}
 
+def audio_callback(indata, frames, time, status):
+    """Callback function for sounddevice stream"""
+    if status:
+        print(f"[AUDIO] Status: {status}")
+    
+    if recording:
+        # Apply gain to boost weak microphone signal
+        audio_float = indata[:, 0] * 10.0  # 20dB boost
+        
+        # Clip to prevent distortion
+        audio_float = np.clip(audio_float, -1.0, 1.0)
+        
+        # Convert float32 to int16 PCM
+        audio_int16 = (audio_float * 32767).astype(np.int16)
+        
+        # Debug: print audio levels every 100 frames to avoid spam
+        if len(audio_buffer) % 1600 == 0:  # every ~0.1s at 16kHz
+            rms = np.sqrt(np.mean(audio_float**2))
+            max_val = np.max(np.abs(audio_float))
+            print(f"[AUDIO] RMS: {rms:.4f}, Max: {max_val:.4f}, Frames: {frames} (10x gain applied)")
+        
+        audio_buffer.extend(audio_int16)
+
+@app.post("/start-recording")
+async def start_recording(device_id: Optional[int] = None) -> Dict[str, Any]:
+    global recording, last_button_press
+    
+    current_time = time.time()
+    if current_time - last_button_press < DEBOUNCE_TIME:
+        return {"status": "debounced", "message": "Button press too soon"}
+    
+    last_button_press = current_time
+    
+    try:
+        if not recording:
+            recording = True
+            audio_buffer.clear()
+            
+            # Find microphone device
+            devices = sd.query_devices()
+            
+            # Use provided device_id or try to find built-in mic
+            if device_id is not None:
+                selected_device = device_id
+                device_info = devices[device_id]
+                print(f"[AUDIO] Using manually selected device: {device_id}")
+            else:
+                # Use device 4 (hw:0,7) - confirmed built-in laptop microphone  
+                candidate_devices = [4]  # hw:0,7 is the working built-in mic
+                selected_device = None
+                
+                for candidate in candidate_devices:
+                    if candidate < len(devices) and devices[candidate]['max_input_channels'] > 0:
+                        selected_device = candidate
+                        break
+                
+                # Fallback to default
+                if selected_device is None:
+                    selected_device = sd.default.device[0]
+                
+                device_info = devices[selected_device]
+            
+            # Print all available input devices for debugging
+            print("[AUDIO] Available input devices:")
+            for i, device in enumerate(devices):
+                if device['max_input_channels'] > 0:
+                    marker = ">>> " if i == selected_device else "    "
+                    print(f"{marker}{i}: {device['name']} ({device['max_input_channels']} channels)")
+            
+            print(f"[AUDIO] Using input device: {device_info['name']} (index: {selected_device})")
+            print(f"[AUDIO] Device sample rate: {device_info['default_samplerate']}")
+            print(f"[AUDIO] Device channels: {device_info['max_input_channels']}")
+            
+            # Start audio stream if not already running
+            if not hasattr(start_recording, 'stream') or start_recording.stream.closed:
+                start_recording.stream = sd.InputStream(
+                    callback=audio_callback,
+                    channels=1,
+                    samplerate=16000,
+                    dtype='float32',
+                    device=selected_device,  # Use specific microphone device
+                    blocksize=1024  # Add blocksize for better performance
+                )
+                start_recording.stream.start()
+                print("[AUDIO] Audio stream started successfully")
+            
+            return {"status": "recording_started", "message": "Recording started successfully"}
+        else:
+            return {"status": "already_recording", "message": "Recording already in progress"}
+    
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to start recording: {str(e)}"}
+
+@app.post("/stop-recording")
+async def stop_recording() -> Dict[str, Any]:
+    global recording, latest_text, last_button_press
+    
+    current_time = time.time()
+    if current_time - last_button_press < DEBOUNCE_TIME:
+        return {"status": "debounced", "message": "Button press too soon"}
+    
+    last_button_press = current_time
+    
+    try:
+        if recording:
+            recording = False
+            
+            # Collect audio data from buffer
+            if len(audio_buffer) > 0:
+                audio_data = np.array(list(audio_buffer), dtype=np.int16)
+                
+                # Save audio as WAV file
+                timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+                wav_file_path = f"/tmp/recording_{timestamp}.wav"
+                
+                try:
+                    with wave.open(wav_file_path, 'wb') as wav_file:
+                        wav_file.setnchannels(1)  # mono
+                        wav_file.setsampwidth(2)  # 16-bit = 2 bytes
+                        wav_file.setframerate(16000)  # 16kHz
+                        wav_file.writeframes(audio_data.tobytes())
+                    
+                    print(f"[DEBUG] Audio saved to: {wav_file_path}")
+                    
+                    # Transcribe audio using Whisper model (same as /transcribe endpoint)
+                    try:
+                        print("[DEBUG] Starting transcription...")
+                        result = model.transcribe(wav_file_path)
+                        transcribed_text = result["text"].strip()
+                        
+                        print(f"[DEBUG] Transcription result: '{transcribed_text}'")
+                        
+                        if transcribed_text:
+                            # Use websearch_agent like in /transcribe endpoint
+                            query = f"Przeszukaj internet i odpowiedz na pytanie: {transcribed_text}. Odpowiedz krótko."
+                            print(f"[DEBUG] Searching with query: {query}")
+                            
+                            search_result = websearch_agent.search(query)
+                            answer = search_result.get("answer", "No answer available")
+                            success = search_result.get("success", False)
+                            
+                            print(f"[DEBUG] Full search result: {search_result}")
+                            print(f"[DEBUG] Answer: '{answer}'")
+                            print(f"[DEBUG] Success: {success}")
+                            
+                            # Handle agent timeout/iteration limit
+                            if (not success or 
+                                "iteration limit" in answer.lower() or 
+                                "time limit" in answer.lower() or
+                                "agent stopped" in answer.lower() or
+                                answer.strip() == ""):
+                                print(f"[DEBUG] WebSearch agent failed, using fallback")
+                                answer = f"Transkrypcja: {transcribed_text} (wyszukiwanie internetowe niedostępne)"
+                            
+                            latest_text = answer
+                            print(f"[DEBUG] Final answer: {answer}")
+                            
+                            return {
+                                "status": "recording_stopped", 
+                                "message": "Recording stopped, transcribed and processed",
+                                "file_path": wav_file_path,
+                                "transcription": transcribed_text,
+                                "answer": answer,
+                                "text": answer
+                            }
+                        else:
+                            latest_text = "No speech detected in recording"
+                            return {
+                                "status": "no_speech", 
+                                "message": "No speech detected in recording",
+                                "file_path": wav_file_path,
+                                "text": latest_text
+                            }
+                            
+                    except Exception as transcription_error:
+                        print(f"[DEBUG] Transcription error: {str(transcription_error)}")
+                        latest_text = f"Audio saved to {wav_file_path} (transcription failed)"
+                        return {
+                            "status": "transcription_error", 
+                            "message": f"Audio saved but transcription failed: {str(transcription_error)}",
+                            "file_path": wav_file_path,
+                            "text": latest_text
+                        }
+                    
+                except Exception as save_error:
+                    latest_text = ""
+                    return {
+                        "status": "save_error", 
+                        "message": f"Failed to save audio file: {str(save_error)}"
+                    }
+            else:
+                latest_text = ""
+                return {
+                    "status": "no_audio", 
+                    "message": "No audio data recorded"
+                }
+        else:
+            return {"status": "not_recording", "message": "Recording was not active"}
+    
+    except Exception as e:
+        latest_text = ""
+        return {"status": "error", "message": f"Failed to stop recording: {str(e)}"}
+
+@app.get("/latest-text")
+async def get_latest_text() -> Dict[str, str]:
+    return {"text": latest_text}
+
 @app.get("/")
 async def root():
     return {"message": "Frank Brain API is running"}
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Clean up resources on shutdown"""
+    global recording
+    recording = False
+    if hasattr(start_recording, 'stream') and not start_recording.stream.closed:
+        start_recording.stream.stop()
+        start_recording.stream.close()
 
 if __name__ == "__main__":
     import uvicorn

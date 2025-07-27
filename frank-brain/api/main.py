@@ -55,6 +55,9 @@ import struct
 import datetime
 processing_lock = False
 
+# Chunked streaming storage
+chunk_sessions = {}  # session_id -> {chunks: {chunk_id: data}, total_chunks: int, received_chunks: int}
+
 @app.post("/stream/")
 async def stream_audio(request: Request) -> Dict[str, Any]:
     global processing_lock
@@ -170,6 +173,104 @@ async def stream_audio(request: Request) -> Dict[str, Any]:
         # search_result = websearch_agent.search(query)
         #
         # return {"answer": search_result.get("answer", "No answer available")}
+
+@app.post("/chunk")
+async def receive_chunk(request: Request) -> Dict[str, Any]:
+    session_id = request.headers.get("X-Session-ID")
+    chunk_id = int(request.headers.get("X-Chunk-ID"))
+    total_chunks = int(request.headers.get("X-Total-Chunks"))
+    
+    if not session_id:
+        raise HTTPException(status_code=400, detail="Missing session ID")
+    
+    body = await request.body()
+    print(f"[CHUNK] Session {session_id}: Received chunk {chunk_id}/{total_chunks-1} ({len(body)} bytes)")
+    
+    # Initialize session if new
+    if session_id not in chunk_sessions:
+        chunk_sessions[session_id] = {
+            "chunks": {},
+            "total_chunks": total_chunks,
+            "received_chunks": 0
+        }
+    
+    # Store chunk
+    chunk_sessions[session_id]["chunks"][chunk_id] = body
+    chunk_sessions[session_id]["received_chunks"] += 1
+    
+    return {"status": "chunk_received", "chunk_id": chunk_id}
+
+@app.post("/complete")
+async def complete_session(request: Request) -> Dict[str, Any]:
+    data = await request.json()
+    session_id = data.get("session_id")
+    
+    if not session_id or session_id not in chunk_sessions:
+        raise HTTPException(status_code=400, detail="Invalid session ID")
+    
+    session = chunk_sessions[session_id]
+    print(f"[COMPLETE] Session {session_id}: {session['received_chunks']}/{session['total_chunks']} chunks received")
+    
+    # Check if all chunks received
+    if session["received_chunks"] != session["total_chunks"]:
+        return {"error": f"Missing chunks: {session['received_chunks']}/{session['total_chunks']}"}
+    
+    # Combine chunks in order
+    audio_data = b""
+    for chunk_id in range(session["total_chunks"]):
+        if chunk_id in session["chunks"]:
+            audio_data += session["chunks"][chunk_id]
+        else:
+            return {"error": f"Missing chunk {chunk_id}"}
+    
+    print(f"[COMPLETE] Combined audio: {len(audio_data)} bytes")
+    
+    # Save combined audio files for testing
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    debug_file_path = f"/tmp/mic_test_{timestamp}_{session_id}.raw"  
+    wav_file_path = f"/tmp/mic_test_{timestamp}_{session_id}.wav"
+    
+    # Save raw audio
+    with open(debug_file_path, "wb") as debug_file:
+        debug_file.write(audio_data)
+    print(f"[SAVED] Raw audio: {debug_file_path}")
+    
+    # Convert to WAV for easy playback testing
+    try:
+        with wave.open(wav_file_path, 'wb') as wav_file:
+            wav_file.setnchannels(1)  # mono
+            wav_file.setsampwidth(2)  # 16-bit = 2 bytes
+            wav_file.setframerate(16000)  # 16kHz
+            wav_file.writeframes(audio_data)
+        print(f"[SAVED] WAV audio: {wav_file_path}")
+        
+        # Clean up session
+        del chunk_sessions[session_id]
+        
+        return {
+            "status": "success",
+            "message": f"Audio saved for testing - {len(audio_data)} bytes",
+            "files": {
+                "raw": debug_file_path,
+                "wav": wav_file_path
+            },
+            "info": {
+                "chunks_received": session["total_chunks"],
+                "total_bytes": len(audio_data),
+                "duration_estimate": f"{len(audio_data) / (16000 * 2):.1f} seconds"
+            }
+        }
+            
+    except Exception as e:
+        print(f"[ERROR] File save failed: {str(e)}")
+        # Clean up session
+        if session_id in chunk_sessions:
+            del chunk_sessions[session_id]
+        return {"error": f"File save failed: {str(e)}"}
+
+@app.get("/sessions")
+async def get_sessions():
+    return {"active_sessions": list(chunk_sessions.keys())}
 
 @app.get("/")
 async def root():

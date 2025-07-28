@@ -331,14 +331,20 @@ async def start_recording(device_id: Optional[int] = None) -> Dict[str, Any]:
                 device_info = devices[device_id]
                 print(f"[AUDIO] Using manually selected device: {device_id}")
             else:
-                # Use device 4 (hw:0,7) - confirmed built-in laptop microphone  
-                candidate_devices = [4]  # hw:0,7 is the working built-in mic
+                # Try multiple device candidates, prefer pulse/pipewire over hw devices
+                candidate_devices = [12, 11, 17]  # pulse, pipewire, default - more compatible than hw devices
                 selected_device = None
                 
                 for candidate in candidate_devices:
                     if candidate < len(devices) and devices[candidate]['max_input_channels'] > 0:
-                        selected_device = candidate
-                        break
+                        try:
+                            # Test if device supports our target sample rate
+                            device_info = devices[candidate]
+                            if device_info['default_samplerate'] >= 16000:
+                                selected_device = candidate
+                                break
+                        except:
+                            continue
                 
                 # Fallback to default
                 if selected_device is None:
@@ -359,16 +365,19 @@ async def start_recording(device_id: Optional[int] = None) -> Dict[str, Any]:
             
             # Start audio stream if not already running
             if not hasattr(start_recording, 'stream') or start_recording.stream.closed:
+                # Use device's native sample rate if it's reasonable, otherwise force 16kHz
+                target_samplerate = int(device_info['default_samplerate']) if device_info['default_samplerate'] in [16000, 22050, 44100, 48000] else 16000
+                
                 start_recording.stream = sd.InputStream(
                     callback=audio_callback,
                     channels=1,
-                    samplerate=16000,
+                    samplerate=target_samplerate,
                     dtype='float32',
                     device=selected_device,  # Use specific microphone device
                     blocksize=1024  # Add blocksize for better performance
                 )
                 start_recording.stream.start()
-                print("[AUDIO] Audio stream started successfully")
+                print(f"[AUDIO] Audio stream started successfully at {target_samplerate}Hz")
             
             return {"status": "recording_started", "message": "Recording started successfully"}
         else:

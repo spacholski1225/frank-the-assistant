@@ -331,24 +331,53 @@ async def start_recording(device_id: Optional[int] = None) -> Dict[str, Any]:
                 device_info = devices[device_id]
                 print(f"[AUDIO] Using manually selected device: {device_id}")
             else:
-                # Try multiple device candidates, prefer pulse/pipewire over hw devices
-                candidate_devices = [12, 11, 17]  # pulse, pipewire, default - more compatible than hw devices
+                # Try to find best microphone device using pattern matching
                 selected_device = None
                 
-                for candidate in candidate_devices:
-                    if candidate < len(devices) and devices[candidate]['max_input_channels'] > 0:
+                # Priority 1: Try specific working device first (hw:0,6 often works better than hw:0,0)
+                working_candidates = [4, 5, 0]  # hw:0,6, hw:0,7, hw:0,0
+                for candidate in working_candidates:
+                    if (candidate < len(devices) and 
+                        devices[candidate]['max_input_channels'] > 0 and
+                        'sof-hda-dsp' in devices[candidate]['name'].lower()):
                         try:
-                            # Test if device supports our target sample rate
-                            device_info = devices[candidate]
-                            if device_info['default_samplerate'] >= 16000:
+                            if devices[candidate]['default_samplerate'] >= 16000:
                                 selected_device = candidate
+                                print(f"[AUDIO] Using sof-hda-dsp device {candidate}: {devices[candidate]['name']}")
                                 break
                         except:
                             continue
                 
-                # Fallback to default
+                # Priority 2: Look for system defaults (pulse, pipewire)
+                if selected_device is None:
+                    preferred_systems = ['pulse', 'pipewire', 'default']
+                    for system in preferred_systems:
+                        for i, device in enumerate(devices):
+                            if (device['max_input_channels'] > 0 and 
+                                system in device['name'].lower()):
+                                try:
+                                    if device['default_samplerate'] >= 16000:
+                                        selected_device = i
+                                        print(f"[AUDIO] Using system audio: {device['name']}")
+                                        break
+                                except:
+                                    continue
+                        if selected_device is not None:
+                            break
+                
+                # Priority 3: Any working input device
+                if selected_device is None:
+                    for i, device in enumerate(devices):
+                        if (device['max_input_channels'] > 0 and 
+                            device['default_samplerate'] >= 16000):
+                            selected_device = i
+                            print(f"[AUDIO] Fallback to first available: {device['name']}")
+                            break
+                
+                # Final fallback to system default
                 if selected_device is None:
                     selected_device = sd.default.device[0]
+                    print(f"[AUDIO] Using system default device")
                 
                 device_info = devices[selected_device]
             
@@ -367,6 +396,9 @@ async def start_recording(device_id: Optional[int] = None) -> Dict[str, Any]:
             if not hasattr(start_recording, 'stream') or start_recording.stream.closed:
                 # Use device's native sample rate if it's reasonable, otherwise force 16kHz
                 target_samplerate = int(device_info['default_samplerate']) if device_info['default_samplerate'] in [16000, 22050, 44100, 48000] else 16000
+                
+                # Store sample rate for later use in stop_recording
+                start_recording.actual_samplerate = target_samplerate
                 
                 start_recording.stream = sd.InputStream(
                     callback=audio_callback,
@@ -409,11 +441,16 @@ async def stop_recording() -> Dict[str, Any]:
                 wav_file_path = f"/tmp/recording_{timestamp}.wav"
                 
                 try:
+                    # Use actual recording sample rate instead of hardcoded 16kHz
+                    actual_samplerate = getattr(start_recording, 'actual_samplerate', 16000)
+                    
                     with wave.open(wav_file_path, 'wb') as wav_file:
                         wav_file.setnchannels(1)  # mono
                         wav_file.setsampwidth(2)  # 16-bit = 2 bytes
-                        wav_file.setframerate(16000)  # 16kHz
+                        wav_file.setframerate(actual_samplerate)  # Use actual sample rate
                         wav_file.writeframes(audio_data.tobytes())
+                    
+                    print(f"[DEBUG] Audio saved with sample rate: {actual_samplerate}Hz")
                     
                     print(f"[DEBUG] Audio saved to: {wav_file_path}")
                     
